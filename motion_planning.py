@@ -4,6 +4,7 @@ import msgpack
 from enum import Enum, auto
 
 import numpy as np
+import re
 
 from planning_utils import a_star, heuristic, create_grid
 from udacidrone import Drone
@@ -24,12 +25,25 @@ class States(Enum):
 
 class MotionPlanning(Drone):
 
-    def __init__(self, connection):
+    def __init__(self, connection, options):
         super().__init__(connection)
 
         self.target_position = np.array([0.0, 0.0, 0.0])
         self.waypoints = []
         self.in_mission = True
+        positions = [
+            (-122.398157, 37.792474, 0),  # short
+            (-122.397239, 37.793910, 0),  # short
+            (-122.396802, 37.794154, 0),  # short
+            ####
+            (-122.398917, 37.792579, 0),  # easy two turns, 20
+            (-122.398692, 37.792685, 30),  # easy two turns + top of building
+            (-122.399280, 37.792970, 80),  # easy two turns + crazy altitude
+            (-122.398248, 37.796342, 0)  # Far
+        ]
+        self.goal_position = positions[2]
+        # self.goal_position = 
+        #self.random_goal = options.random_goal
         self.check_state = {}
 
         # initial state
@@ -87,7 +101,8 @@ class MotionPlanning(Drone):
         print("waypoint transition")
         self.target_position = self.waypoints.pop(0)
         print('target position', self.target_position)
-        self.cmd_position(self.target_position[0], self.target_position[1], self.target_position[2], self.target_position[3])
+        self.cmd_position(self.target_position[0], self.target_position[1],
+                          self.target_position[2], self.target_position[3])
 
     def landing_transition(self):
         self.flight_state = States.LANDING
@@ -114,33 +129,33 @@ class MotionPlanning(Drone):
     def plan_path(self):
         self.flight_state = States.PLANNING
         print("Searching for a path ...")
-        TARGET_ALTITUDE = 5
+        TARGET_ALTITUDE = 25
         SAFETY_DISTANCE = 5
 
         self.target_position[2] = TARGET_ALTITUDE
 
-        # TODO: read lat0, lon0 from colliders into floating point values
-        
-        # TODO: set home position to (lon0, lat0, 0)
+        init_pos = self.get_home_coordinates()
+        self.set_home_position(init_pos[1], init_pos[0], 0)
 
         # TODO: retrieve current global position
- 
+        local_position = global_to_local(self.global_position, self.global_home)
+        goal_position = global_to_local(self.goal_position, self.global_home)
         # TODO: convert to current local position using global_to_local()
-        
+
         print('global home {0}, position {1}, local position {2}'.format(self.global_home, self.global_position,
                                                                          self.local_position))
         # Read in obstacle map
+
+        print(local_position)
         data = np.loadtxt('colliders.csv', delimiter=',', dtype='Float64', skiprows=2)
-        
+
         # Define a grid for a particular altitude and safety margin around obstacles
         grid, north_offset, east_offset = create_grid(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
         print("North offset = {0}, east offset = {1}".format(north_offset, east_offset))
         # Define starting point on the grid (this is just grid center)
-        grid_start = (-north_offset, -east_offset)
-        # TODO: convert start position to current position rather than map center
-        
-        # Set goal as some arbitrary position on the grid
-        grid_goal = (-north_offset + 10, -east_offset + 10)
+
+        grid_start = self.get_relative_coords(local_position, north_offset, east_offset)
+        grid_goal = self.get_relative_coords(goal_position, north_offset, east_offset)
         # TODO: adapt to set goal as latitude / longitude position and convert
 
         # Run A* to find a path from start to goal
@@ -170,15 +185,26 @@ class MotionPlanning(Drone):
 
         self.stop_log()
 
+    def get_home_coordinates(self):
+        line = re.split(",|lat0|lon0| |\n", open("colliders.csv").readline())
+        line = list(filter(lambda l: l, line))
+        return tuple(map(lambda a: float(a), line))
+
+    def get_relative_coords(self, local_position, north_offset, east_offset):
+        north = int(np.ceil(local_position[0] - north_offset))
+        east = int(np.ceil(local_position[1] - east_offset))
+        return (north, east)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=5760, help='Port number')
     parser.add_argument('--host', type=str, default='127.0.0.1', help="host address, i.e. '127.0.0.1'")
+    parser.add_argument('--random_goal', type=bool, default=False, help="Random goal")
     args = parser.parse_args()
 
     conn = MavlinkConnection('tcp:{0}:{1}'.format(args.host, args.port), timeout=60)
-    drone = MotionPlanning(conn)
+    drone = MotionPlanning(conn, {"random_goal": args.random_goal})
     time.sleep(1)
 
     drone.start()
