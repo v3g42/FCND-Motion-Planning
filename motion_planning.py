@@ -6,8 +6,8 @@ from enum import Enum, auto
 import numpy as np
 import re
 
-# from planning_utils import a_star, heuristic, create_grid
-from graph_planning_utils import a_star, heuristic, create_grid_and_edges, closest_point, create_graph
+# from planning_utils_starter import a_star, heuristic, create_grid
+from planning_utils import a_star, heuristic, create_grid, closest_point, create_graph_voronoi, create_graph_probabilistic, get_min_north_east
 from udacidrone import Drone
 from udacidrone.connection import MavlinkConnection
 from udacidrone.messaging import MsgID
@@ -32,19 +32,10 @@ class MotionPlanning(Drone):
         self.target_position = np.array([0.0, 0.0, 0.0])
         self.waypoints = []
         self.in_mission = True
-        positions = [
-            (-122.398157, 37.792474, 0),  # short
-            (-122.397239, 37.793910, 0),  # short
-            (-122.396802, 37.794154, 0),  # short
-            ####
-            (-122.398917, 37.792579, 0),  # easy two turns, 20
-            (-122.398692, 37.792685, 30),  # easy two turns + top of building
-            (-122.399280, 37.792970, 80),  # easy two turns + crazy altitude
-            (-122.398248, 37.796342, 0)  # Far
-        ]
-        self.goal_position = positions[2]
-        # self.goal_position = 
-        # self.random_goal = options.random_goal
+
+        self.goal_position = list(map(lambda s: float(s), str.split(options["goal_position"], ",")))
+
+        self.probabilistic_mode = bool(options["probabilistic_mode"])
         self.check_state = {}
 
         # initial state
@@ -60,7 +51,11 @@ class MotionPlanning(Drone):
             if -1.0 * self.local_position[2] > 0.95 * self.target_position[2]:
                 self.waypoint_transition()
         elif self.flight_state == States.WAYPOINT:
-            if np.linalg.norm(self.target_position[0:2] - self.local_position[0:2]) < 1.0:
+            # band_distance for all the waypoints except the last can be higher
+            band_distance = 1.0
+            if(len(self.waypoints) > 1):
+                band_distance = 4.0
+            if np.linalg.norm(self.target_position[0:2] - self.local_position[0:2]) < band_distance:
                 if len(self.waypoints) > 0:
                     self.waypoint_transition()
                 else:
@@ -70,7 +65,9 @@ class MotionPlanning(Drone):
     def velocity_callback(self):
         if self.flight_state == States.LANDING:
             if self.global_position[2] - self.global_home[2] < 0.1:
-                if abs(self.local_position[2]) < 0.01:
+                print("velocity", np.linalg.norm(self.local_velocity[1:2]))
+                print("velocity", np.linalg.norm(self.local_velocity[0:2]))
+                if np.linalg.norm(self.local_velocity[1:2]) < 1.0:
                     self.disarming_transition()
 
     def state_callback(self):
@@ -130,55 +127,78 @@ class MotionPlanning(Drone):
     def plan_path(self):
         self.flight_state = States.PLANNING
         print("Searching for a path ...")
-        TARGET_ALTITUDE = 10
+        TARGET_ALTITUDE = int(self.goal_position[2] * 1.1) + 5
         SAFETY_DISTANCE = 5
 
-        self.target_position[2] = TARGET_ALTITUDE
+        # Assuming home is always set at 0
+        self.target_position[2] = self.goal_position[2]
 
         init_pos = self.get_home_coordinates()
         self.set_home_position(init_pos[1], init_pos[0], 0)
 
-        # TODO: retrieve current global position
         local_position = global_to_local(self.global_position, self.global_home)
         goal_position = global_to_local(self.goal_position, self.global_home)
-        # TODO: convert to current local position using global_to_local()
 
         print('global home {0}, position {1}, local position {2}'.format(self.global_home, self.global_position,
                                                                          self.local_position))
         # Read in obstacle map
-
-        print(local_position)
         data = np.loadtxt('colliders.csv', delimiter=',', dtype='Float64', skiprows=2)
 
-        # Define a grid for a particular altitude and safety margin around obstacles
-        grid, edges, north_offset, east_offset = create_grid_and_edges(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
-        graph = create_graph(edges)
-        print("North offset = {0}, east offset = {1}, No of edges: {2}".format(north_offset, east_offset, len(edges)))
+        graph = None
+        north_offset = None
+        east_offset = None
+        alt_dim = False
+        if(self.probabilistic_mode):
+            alt_dim = True
+            print('********************************************')
+            print(" Using probabalistic mode")
+            print('********************************************')
+            t0 = time.time()
+            graph = create_graph_probabilistic(data, TARGET_ALTITUDE, int(SAFETY_DISTANCE / 2))
+            print('graph took {0} seconds to build'.format(time.time() - t0))
+            north_offset, east_offset = get_min_north_east(data)
+        else:
+            print('********************************************')
+            print(" Using graph with voronoi")
+            print('********************************************')
+            graph, north_offset, east_offset = create_graph_voronoi(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
 
-        grid_start = self.get_relative_coords(local_position, north_offset, east_offset)
-        grid_goal = self.get_relative_coords(goal_position, north_offset, east_offset)
+        print(north_offset, east_offset)
+        graph_start = self.get_relative_coords(local_position, north_offset, east_offset, alt_dim)
+        graph_goal = self.get_relative_coords(goal_position, north_offset, east_offset, alt_dim)
 
         # Get closest points on the graph
-        grid_start_c = closest_point(graph, grid_start)
-        grid_goal_c = closest_point(graph, grid_goal)
+        graph_start_c = closest_point(graph, graph_start)
+        graph_goal_c = closest_point(graph, graph_goal)
         # Create Graph
 
-        # Run A* to find a path from start to goal
-        # TODO: add diagonal motions with a cost of sqrt(2) to your A* implementation
-        # or move to a different search space such as a graph (not done here)
-        print('Local Start and Goal and closest points: ', grid_start, grid_start_c, grid_goal, grid_goal_c)
-        path, _ = a_star(graph, heuristic, grid_start_c, grid_goal_c)
+        # Run A* to find a path from start to goal 
+        print('Local Start and Goal and closest points: ', graph_start, graph_start_c, graph_goal, graph_goal_c)
+        path, _ = a_star(graph, heuristic, graph_start_c, graph_goal_c)
 
         # Convert path to waypoints
-        waypoints = [[grid_start[0] + north_offset, grid_start[1] +
-                      east_offset, TARGET_ALTITUDE, 0]]  # Add start position
+        waypoints = [
+            [
+                graph_start[0] + north_offset, 
+                graph_start[1] + east_offset, 
+                TARGET_ALTITUDE, 
+                0
+            ]
+        ] 
         waypoints = waypoints + [[
             int(np.ceil(p[0] + north_offset)),
             int(np.ceil(p[1] + east_offset)), 
             TARGET_ALTITUDE, 
             0] for p in path]
-        waypoints = waypoints + [[grid_goal[0] + north_offset, grid_goal[1] +
-                                  east_offset, grid_goal[2], 0]]
+
+        waypoints = waypoints + [
+            [
+                int(np.ceil(graph_goal[0] + north_offset)), 
+                int(np.ceil(graph_goal[1] + east_offset)), 
+                TARGET_ALTITUDE, 
+                0
+            ]
+        ]
         # Set self.waypoints
         self.waypoints = waypoints
         # TODO: send waypoints to sim (this is just for visualization of waypoints)
@@ -201,9 +221,12 @@ class MotionPlanning(Drone):
         line = list(filter(lambda l: l, line))
         return tuple(map(lambda a: float(a), line))
 
-    def get_relative_coords(self, local_position, north_offset, east_offset):
+    def get_relative_coords(self, local_position, north_offset, east_offset, alt_dim=False):
         north = int(np.ceil(local_position[0] - north_offset))
         east = int(np.ceil(local_position[1] - east_offset))
+        if alt_dim:
+            alt = int(np.ceil(local_position[2]))
+            return (north, east, alt)
         return (north, east)
 
 
@@ -211,11 +234,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=5760, help='Port number')
     parser.add_argument('--host', type=str, default='127.0.0.1', help="host address, i.e. '127.0.0.1'")
-    parser.add_argument('--random_goal', type=bool, default=False, help="Random goal")
+
+    # sample positions
+    # positions = [
+    #     (-122.398157, 37.792474, 0),  # short
+    #     (-122.396826, 37.794126, 3),  # short on building
+    #     ####
+    #     (-122.398917, 37.792579, 0),  # easy two turns, 20
+    #     (-122.398692, 37.792685, 12),  # easy two turns + top of building
+    #     (-122.399280, 37.792970, 80),  # easy two turns + crazy altitude
+    #     (-122.398248, 37.796342, 0)  # Far
+    # ]
+    parser.add_argument('--goal_position', type=str, default="-122.398157,37.792474,0",
+                        help="Lon, Lat, Alt: -122.398157,37.792474,0")
+    parser.add_argument('--probabilistic_mode', type=bool, default=False, help="Enable probabilistic mode")
     args = parser.parse_args()
 
     conn = MavlinkConnection('tcp:{0}:{1}'.format(args.host, args.port), timeout=60)
-    drone = MotionPlanning(conn, {"random_goal": args.random_goal})
+    drone = MotionPlanning(conn, {
+        "goal_position": args.goal_position,
+        "probabilistic_mode": args.probabilistic_mode
+    })
     time.sleep(1)
 
     drone.start()
